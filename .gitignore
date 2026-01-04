@@ -1,0 +1,41 @@
+# ESP32 build files
+/build/
+/.bin/
+/.ino.cpp
+/.vscode/
+/*.elf
+/*.map
+/*.d
+/*.o
+/*.a
+
+# Arduino IDE
+*.elf
+*.hex
+*.ino.cpp
+*.ino.d
+*.o
+*.a
+
+# PlatformIO
+.pio/
+.vscode/
+.idea/
+*.pio/
+build/
+*.log
+
+# System files (macOS, Linux, Windows)
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# User-specific IDE settings
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
