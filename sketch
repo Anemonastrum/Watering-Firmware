@@ -1,0 +1,399 @@
+/***************************************************
+ * PIN CONFIGURATION
+ ***************************************************/
+#define OLED_SDA 4
+#define OLED_SCL 5
+#define DHT_PIN 10
+#define RELAY_PIN 9
+#define WATER_LEVEL_PIN 6
+#define SOIL_PIN 7
+
+/***************************************************
+ * WIFI CONFIG
+ ***************************************************/
+const char *WIFI_SSID = "milo";
+const char *WIFI_PASSWORD = "milomilo";
+
+/***************************************************
+ * MQTT CONFIG (NON-TLS)
+ ***************************************************/
+const char *MQTT_BROKER   = "70.153.137.234";
+const int   MQTT_PORT     = 1883;
+const char *MQTT_USER     = "iotwatering01";
+const char *MQTT_PASSWORD = "passwd";
+const char *DEVICE_ID     = "iotwatering01";
+
+/***************************************************
+ * MQTT TOPICS (CORRECT & SAFE)
+ ***************************************************/
+String topicTelemetry   = "watering/iotwatering01/telemetry";
+String topicStatus      = "watering/iotwatering01/status";
+String topicCmdPump     = "watering/iotwatering01/command/pump";
+String topicConfigSet   = "watering/iotwatering01/config/set";
+String topicConfigState = "watering/iotwatering01/config/state";
+
+/***************************************************
+ * DEFAULT SETTINGS
+ ***************************************************/
+int  soilDryThreshold = 450;
+bool autoMode         = true;
+int  pumpDurationSec  = 10;
+int  waterMinLevel    = 500;
+
+/***************************************************
+ * INCLUDES
+ ***************************************************/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/***************************************************
+ * OBJECTS
+ ***************************************************/
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+DHT dht(DHT_PIN, DHT22);
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/***************************************************
+ * GLOBALS
+ ***************************************************/
+unsigned long lastTelemetry     = 0;
+unsigned long lastScreenSwitch  = 0;
+unsigned long lastWiFiAttempt   = 0;
+unsigned long lastMQTTAttempt  = 0;
+unsigned long mqttConnectedAt  = 0;
+unsigned long uptimeSec = 0;
+
+bool  configSynced   = false;
+bool  pumpRunning    = false;
+unsigned long pumpStartTime = 0;
+
+float temperature = 0;
+float humidity    = 0;
+int   soilMoisture = 0;
+int   waterLevel   = 0;
+
+int currentScreen = 0;
+
+bool manualPumpActive = false;
+unsigned long manualPumpDurationMs = 0;
+
+/***************************************************
+ * PUMP PROGRESS OLED
+ ***************************************************/
+
+ void drawPumpProgressScreen()
+  {
+    unsigned long elapsed = millis() - pumpStartTime;
+    int percent = (elapsed * 100) / manualPumpDurationMs;
+    if (percent > 100) percent = 100;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+
+    display.println("PUMP RUNNING");
+    display.printf("Mode: MANUAL\n");
+    display.printf("Time: %lu / %lu s\n",
+                  elapsed / 1000,
+                  manualPumpDurationMs / 1000);
+    display.printf("Progress: %d%%\n\n", percent);
+
+    // Progress bar
+    int barWidth = map(percent, 0, 100, 0, 120);
+    display.drawRect(0, 50, 128, 10, SSD1306_WHITE);
+    display.fillRect(4, 52, barWidth, 6, SSD1306_WHITE);
+
+    display.display();
+  }
+
+
+/***************************************************
+ * PUBLISH CONFIG STATE (RETAINED)
+ ***************************************************/
+void publishConfig()
+{
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["auto_mode"]       = autoMode;
+  doc["dry_threshold"]   = soilDryThreshold;
+  doc["pump_duration"]   = pumpDurationSec;
+  doc["water_min_level"] = waterMinLevel;
+  doc["pump_running"]    = pumpRunning;
+
+  char buf[256];
+  serializeJson(doc, buf);
+  mqttClient.publish(topicConfigState.c_str(), buf, true);
+}
+
+/***************************************************
+ * WIFI CONNECT (NON-BLOCKING)
+ ***************************************************/
+void connectWiFi()
+{
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastWiFiAttempt < 10000) return;
+
+  lastWiFiAttempt = millis();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("Connecting WiFi...");
+}
+
+/***************************************************
+ * MQTT CALLBACK
+ ***************************************************/
+void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload, length)) return;
+
+  /* ---------- MANUAL PUMP COMMAND ---------- */
+  if (String(topic) == topicCmdPump)
+  {
+    const char *state = doc["state"];
+    int duration = doc["duration"] | pumpDurationSec;
+
+    if (state && strcmp(state, "ON") == 0)
+    {
+      autoMode = false;
+      pumpRunning = true;
+      manualPumpActive = true;
+      manualPumpDurationMs = duration * 1000UL;
+      pumpStartTime = millis();
+
+      digitalWrite(RELAY_PIN, HIGH);
+      publishConfig();
+    }
+    else
+    {
+      pumpRunning = false;
+      manualPumpActive = false;
+      digitalWrite(RELAY_PIN, LOW);
+      publishConfig();
+    }
+  }
+
+  /* ---------- CONFIG SET (ONLY THIS TOPIC!) ---------- */
+  if (String(topic) == topicConfigSet)
+  {
+    bool changed = false;
+
+    if (doc.containsKey("dry_threshold")) {
+      soilDryThreshold = doc["dry_threshold"];
+      changed = true;
+    }
+
+    if (doc.containsKey("auto_mode")) {
+      autoMode = doc["auto_mode"];
+      changed = true;
+    }
+
+    if (doc.containsKey("pump_duration")) {
+      pumpDurationSec = doc["pump_duration"];
+      changed = true;
+    }
+
+    if (changed)
+    {
+      configSynced = true;
+      publishConfig();
+    }
+  }
+}
+
+/***************************************************
+ * MQTT CONNECT (NON-BLOCKING)
+ ***************************************************/
+void connectMQTT()
+{
+  if (mqttClient.connected()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastMQTTAttempt < 5000) return;
+
+  lastMQTTAttempt = millis();
+
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  if (mqttClient.connect(
+        DEVICE_ID,
+        MQTT_USER,
+        MQTT_PASSWORD,
+        topicStatus.c_str(),
+        1,
+        true,
+        "{\"online\":false}"))
+  {
+    Serial.println("MQTT CONNECTED");
+
+    mqttClient.subscribe(topicCmdPump.c_str());
+    mqttClient.subscribe(topicConfigSet.c_str());
+
+    mqttConnectedAt = millis();
+    configSynced = false;
+
+    StaticJsonDocument<64> doc;
+    doc["online"] = true;
+    char buf[64];
+    serializeJson(doc, buf);
+    mqttClient.publish(topicStatus.c_str(), buf, true);
+  }
+}
+
+/***************************************************
+ * OLED
+ ***************************************************/
+ void drawSensorScreen()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  display.printf("Temp: %.1f C\n", temperature);
+  display.printf("Hum : %.1f %%\n", humidity);
+  display.printf("Soil: %d\n", soilMoisture);
+  display.printf("Tank: %d\n", waterLevel);
+  display.printf("Pump: %s %s\n",
+                 pumpRunning ? "ON" : "OFF",
+                 autoMode ? "AUTO" : "MAN");
+
+  display.display();
+}
+
+void drawNetworkScreen()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  display.printf("WiFi : %s\n",
+                 WiFi.status() == WL_CONNECTED ? "OK" : "DOWN");
+  display.printf("MQTT : %s\n",
+                 mqttClient.connected() ? "OK" : "DOWN");
+  display.printf("IP   : %s\n",
+                 WiFi.localIP().toString().c_str());
+
+  display.display();
+}
+
+/***************************************************
+ * SETUP
+ ***************************************************/
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.setTextColor(SSD1306_WHITE);
+
+  dht.begin();
+  Serial.println("System ready");
+}
+
+/***************************************************
+ * LOOP
+ ***************************************************/
+void loop()
+{
+  connectWiFi();
+  connectMQTT();
+  mqttClient.loop();
+
+  /* Publish defaults if no retained config exists */
+  if (mqttClient.connected() && !configSynced &&
+      millis() - mqttConnectedAt > 2000)
+  {
+    configSynced = true;
+    publishConfig();
+  }
+
+  /* Telemetry */
+  if (millis() - lastTelemetry > 1000)
+  {
+    lastTelemetry = millis();
+
+    temperature = dht.readTemperature();
+    humidity    = dht.readHumidity();
+    soilMoisture = analogRead(SOIL_PIN);
+    waterLevel   = analogRead(WATER_LEVEL_PIN);
+
+    if (waterLevel <= waterMinLevel)
+    {
+      pumpRunning = false;
+      digitalWrite(RELAY_PIN, LOW);
+    }
+    else if (autoMode)
+    {
+      if (!pumpRunning && soilMoisture > soilDryThreshold)
+      {
+        pumpRunning = true;
+        pumpStartTime = millis();
+        digitalWrite(RELAY_PIN, HIGH);
+      }
+
+      if (pumpRunning &&
+          millis() - pumpStartTime >= pumpDurationSec * 1000UL)
+      {
+        pumpRunning = false;
+        digitalWrite(RELAY_PIN, LOW);
+      }
+    }
+
+    StaticJsonDocument<256> doc;
+    doc["temperature"]    = temperature;
+    doc["humidity"]       = humidity;
+    doc["soil_moisture"]  = soilMoisture;
+    doc["water_level"]    = waterLevel;
+
+    doc["uptime_sec"] = millis() / 1000;
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      doc["ip_address"] = WiFi.localIP().toString();
+    }
+    else
+    {
+      doc["ip_address"] = "0.0.0.0";
+    }
+
+    char buf[256];
+    serializeJson(doc, buf);
+    mqttClient.publish(topicTelemetry.c_str(), buf);
+  }
+  // Switch screen every 10 seconds
+  if (millis() - lastScreenSwitch > 10000)
+  {
+    lastScreenSwitch = millis();
+    currentScreen = !currentScreen;
+  }
+
+  // Pump temp
+  if (manualPumpActive && pumpRunning)
+  {
+    drawPumpProgressScreen();
+  }
+
+  // Draw screen
+  if (currentScreen == 0)
+    drawSensorScreen();
+  else
+    drawNetworkScreen();
+
+}
