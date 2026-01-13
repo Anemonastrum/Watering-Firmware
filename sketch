@@ -160,12 +160,18 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   /* ---------- MANUAL PUMP COMMAND ---------- */
   if (String(topic) == topicCmdPump)
   {
+    // reject
+    if (autoMode)
+    {
+      Serial.println("Pump command ignored (AUTO mode)");
+      return;
+    }
+
     const char *state = doc["state"];
     int duration = doc["duration"] | pumpDurationSec;
 
     if (state && strcmp(state, "ON") == 0)
     {
-      autoMode = false;
       pumpRunning = true;
       manualPumpActive = true;
       manualPumpDurationMs = duration * 1000UL;
@@ -324,6 +330,20 @@ void loop()
     publishConfig();
   }
 
+  /* ================================
+     MANUAL PUMP TIMER
+     ================================ */
+  if (manualPumpActive && pumpRunning)
+  {
+    if (millis() - pumpStartTime >= manualPumpDurationMs)
+    {
+      pumpRunning = false;
+      manualPumpActive = false;
+      digitalWrite(RELAY_PIN, LOW);
+      publishConfig();
+    }
+  }
+
   /* Telemetry */
   if (millis() - lastTelemetry > 1000)
   {
@@ -337,9 +357,10 @@ void loop()
     if (waterLevel <= waterMinLevel)
     {
       pumpRunning = false;
+      manualPumpActive = false;
       digitalWrite(RELAY_PIN, LOW);
     }
-    else if (autoMode)
+    else if (autoMode && !manualPumpActive)
     {
       if (!pumpRunning && soilMoisture > soilDryThreshold)
       {
@@ -385,15 +406,16 @@ void loop()
   }
 
   // Pump temp
+  // ---------- OLED PRIORITY ----------
   if (manualPumpActive && pumpRunning)
   {
     drawPumpProgressScreen();
   }
-
-  // Draw screen
-  if (currentScreen == 0)
-    drawSensorScreen();
   else
-    drawNetworkScreen();
-
+  {
+    if (currentScreen == 0)
+      drawSensorScreen();
+    else
+      drawNetworkScreen();
+  }
 }
