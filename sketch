@@ -93,6 +93,7 @@ unsigned long manualPumpDurationMs = 0;
  void drawPumpProgressScreen()
   {
     unsigned long elapsed = millis() - pumpStartTime;
+    if (manualPumpDurationMs == 0) manualPumpDurationMs = 1000;
     int percent = (elapsed * 100) / manualPumpDurationMs;
     if (percent > 100) percent = 100;
 
@@ -109,6 +110,8 @@ unsigned long manualPumpDurationMs = 0;
 
     // Progress bar
     int barWidth = map(percent, 0, 100, 0, 120);
+    barWidth = constrain(barWidth, 0, 120);
+    
     display.drawRect(0, 50, 128, 10, SSD1306_WHITE);
     display.fillRect(4, 52, barWidth, 6, SSD1306_WHITE);
 
@@ -299,11 +302,14 @@ void setup()
 {
   Serial.begin(115200);
 
+  mqttClient.setBufferSize(512);
+
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+  analogSetPinAttenuation(WATER_LEVEL_PIN, ADC_11db);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -349,8 +355,12 @@ void loop()
   {
     lastTelemetry = millis();
 
-    temperature = dht.readTemperature();
-    humidity    = dht.readHumidity();
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (!isnan(t)) temperature = t;
+    if (!isnan(h)) humidity = h;
+
     soilMoisture = analogRead(SOIL_PIN);
     waterLevel   = analogRead(WATER_LEVEL_PIN);
 
@@ -359,6 +369,7 @@ void loop()
       pumpRunning = false;
       manualPumpActive = false;
       digitalWrite(RELAY_PIN, LOW);
+      publishConfig();
     }
     else if (autoMode && !manualPumpActive)
     {
